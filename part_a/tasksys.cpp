@@ -51,19 +51,32 @@ const char* TaskSystemParallelSpawn::name() {
 }
 
 TaskSystemParallelSpawn::TaskSystemParallelSpawn(int num_threads): ITaskSystem(num_threads) {
+    this->num_threads_ = num_threads;
 }
 
-TaskSystemParallelSpawn::~TaskSystemParallelSpawn() {}
+TaskSystemParallelSpawn::~TaskSystemParallelSpawn() {
+}
 
 void TaskSystemParallelSpawn::run(IRunnable* runnable, int num_total_tasks) {
-
+    int num_workers = std::min(this->num_threads_, num_total_tasks);
+    this->next_task_id_.store(0, std::memory_order_relaxed);
     std::vector<std::thread> threads;
-    for (int i = 0; i < num_total_tasks; i++) {
-        threads.emplace_back(&IRunnable::runTask, runnable, i, num_total_tasks);
+    for (int i = 0; i < num_workers; i++) {
+        threads.emplace_back(&TaskSystemParallelSpawn::Worker, this, num_total_tasks, runnable);
     }
 
-    for (int i = 0; i < num_total_tasks; i++) {
+    for (int i = 0; i < num_workers; i++) {
         threads[i].join();
+    }
+}
+
+void TaskSystemParallelSpawn::Worker(int num_task, IRunnable* runnable) {
+    while (this->next_task_id_.load(std::memory_order_acquire) < num_task) {
+        int id = this->next_task_id_.fetch_add(1, std::memory_order_relaxed);
+        if (id >= num_task) {
+            break;
+        }
+        runnable->runTask(id, num_task);
     }
 }
 
