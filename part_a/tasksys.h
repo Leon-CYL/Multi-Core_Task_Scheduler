@@ -6,6 +6,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <condition_variable>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -90,6 +91,21 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                 const std::vector<TaskID>& deps);
         void sync();
+
+    private:
+        std::vector<std::thread> thread_pool;
+        IRunnable* runnable_;
+        std::atomic<int> total_tasks_;
+        int num_threads_;
+        int sleep_chunk_size_;
+        std::atomic<int> next_task_id_;
+        std::atomic<int> completed_tasks_;
+        std::atomic<bool> shut_down_;
+        std::atomic<bool> has_task_;
+        std::mutex cv_mutex_;
+        std::condition_variable worker_cv_;
+        std::condition_variable done_cv_;
+        void workerLoop();
 };
 
 #endif
