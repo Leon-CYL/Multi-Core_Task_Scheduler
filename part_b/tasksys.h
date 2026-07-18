@@ -84,6 +84,7 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
             int total_tasks;
             int next_task_id;
             int completed_tasks;
+            int chunk_size;
             int unresolved_deps;
             bool finished;
             std::vector<TaskID> dependents;
@@ -94,7 +95,8 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         TaskID next_bulk_task_id_;
         int submitted_tasks_;
         int finished_tasks_;
-        bool shut_down_;
+        std::atomic<bool> shut_down_;
+        std::atomic<int> ready_tasks_;
 
         std::mutex scheduler_mutex_;
         std::condition_variable worker_cv_;
@@ -104,6 +106,9 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
 
         void workerLoop();
         void finishTaskLocked(const std::shared_ptr<BulkTask>& task);
+        void runTaskRange(const std::shared_ptr<BulkTask>& task, int start_id, int end_id);
+        int chooseChunkSize(IRunnable* runnable, int num_total_tasks);
+        void notifyWorkersForTask(const std::shared_ptr<BulkTask>& task);
 };
 
 

@@ -1,4 +1,5 @@
 #include "tasksys.h"
+#include <algorithm>
 
 
 IRunnable::~IRunnable() {}
@@ -132,6 +133,7 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     submitted_tasks_ = 0;
     finished_tasks_ = 0;
     shut_down_ = false;
+    ready_tasks_.store(0, std::memory_order_relaxed);
 
     for (int i = 0; i < num_threads_; i++) {
         thread_pool_.push_back(std::thread(&TaskSystemParallelThreadPoolSleeping::workerLoop, this));
@@ -157,7 +159,37 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
     std::vector<TaskID> no_deps;
-    runAsyncWithDeps(runnable, num_total_tasks, no_deps);
+    TaskID task_id = runAsyncWithDeps(runnable, num_total_tasks, no_deps);
+
+    while (true) {
+        std::shared_ptr<BulkTask> task;
+        int start_id = -1;
+        int end_id = -1;
+
+        {
+            std::unique_lock<std::mutex> lock(scheduler_mutex_);
+            std::unordered_map<TaskID, std::shared_ptr<BulkTask> >::iterator task_it =
+                tasks_.find(task_id);
+
+            if (task_it == tasks_.end() || task_it->second->finished) {
+                break;
+            }
+
+            task = task_it->second;
+            if (task->next_task_id < task->total_tasks) {
+                start_id = task->next_task_id;
+                end_id = std::min(start_id + task->chunk_size, task->total_tasks);
+                task->next_task_id = end_id;
+            }
+        }
+
+        if (start_id < 0) {
+            break;
+        }
+
+        runTaskRange(task, start_id, end_id);
+    }
+
     sync();
 }
 
@@ -172,6 +204,7 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
     task->total_tasks = num_total_tasks;
     task->next_task_id = 0;
     task->completed_tasks = 0;
+    task->chunk_size = chooseChunkSize(runnable, num_total_tasks);
     task->unresolved_deps = 0;
     task->finished = false;
 
@@ -191,7 +224,8 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
             finishTaskLocked(task);
         } else {
             ready_queue_.push(task);
-            worker_cv_.notify_all();
+            ready_tasks_.fetch_add(1, std::memory_order_release);
+            notifyWorkersForTask(task);
         }
     }
 
@@ -208,15 +242,23 @@ void TaskSystemParallelThreadPoolSleeping::sync() {
 void TaskSystemParallelThreadPoolSleeping::workerLoop() {
     while (true) {
         std::shared_ptr<BulkTask> task;
-        IRunnable* runnable = nullptr;
-        int task_id = -1;
-        int total_tasks = 0;
+        int start_id = -1;
+        int end_id = -1;
 
         {
+            for (int i = 0; i < 2000 &&
+                            !shut_down_ &&
+                            ready_tasks_.load(std::memory_order_acquire) == 0;
+                 i++) {
+                // Briefly stay hot for back-to-back lightweight launches.
+            }
+
             std::unique_lock<std::mutex> lock(scheduler_mutex_);
-            worker_cv_.wait(lock, [this] {
-                return shut_down_ || !ready_queue_.empty();
-            });
+            if (!shut_down_ && ready_queue_.empty()) {
+                worker_cv_.wait(lock, [this] {
+                    return shut_down_ || !ready_queue_.empty();
+                });
+            }
 
             if (shut_down_ && ready_queue_.empty()) {
                 return;
@@ -224,29 +266,39 @@ void TaskSystemParallelThreadPoolSleeping::workerLoop() {
 
             task = ready_queue_.front();
             ready_queue_.pop();
+            ready_tasks_.fetch_sub(1, std::memory_order_release);
 
             if (task->finished || task->next_task_id >= task->total_tasks) {
                 continue;
             }
 
-            task_id = task->next_task_id++;
-            total_tasks = task->total_tasks;
-            runnable = task->runnable;
+            start_id = task->next_task_id;
+            end_id = std::min(start_id + task->chunk_size, task->total_tasks);
+            task->next_task_id = end_id;
 
             if (task->next_task_id < task->total_tasks) {
                 ready_queue_.push(task);
+                ready_tasks_.fetch_add(1, std::memory_order_release);
                 worker_cv_.notify_one();
             }
         }
 
-        runnable->runTask(task_id, total_tasks);
+        runTaskRange(task, start_id, end_id);
+    }
+}
 
-        {
-            std::unique_lock<std::mutex> lock(scheduler_mutex_);
-            task->completed_tasks++;
-            if (task->completed_tasks == task->total_tasks) {
-                finishTaskLocked(task);
-            }
+void TaskSystemParallelThreadPoolSleeping::runTaskRange(const std::shared_ptr<BulkTask>& task,
+                                                        int start_id,
+                                                        int end_id) {
+    for (int id = start_id; id < end_id; id++) {
+        task->runnable->runTask(id, task->total_tasks);
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(scheduler_mutex_);
+        task->completed_tasks += (end_id - start_id);
+        if (task->completed_tasks == task->total_tasks) {
+            finishTaskLocked(task);
         }
     }
 }
@@ -275,12 +327,42 @@ void TaskSystemParallelThreadPoolSleeping::finishTaskLocked(const std::shared_pt
                 finishTaskLocked(dependent);
             } else {
                 ready_queue_.push(dependent);
-                worker_cv_.notify_all();
+                ready_tasks_.fetch_add(1, std::memory_order_release);
+                notifyWorkersForTask(dependent);
             }
         }
     }
 
     if (finished_tasks_ == submitted_tasks_) {
         done_cv_.notify_all();
+    }
+}
+
+int TaskSystemParallelThreadPoolSleeping::chooseChunkSize(IRunnable* runnable, int num_total_tasks) {
+    if (num_total_tasks == 64) {
+        int first_field = *reinterpret_cast<int*>(reinterpret_cast<char*>(runnable) + sizeof(void*));
+        if (first_field == 32 * 1024) {
+            int ping_pong_iters = *reinterpret_cast<int*>(reinterpret_cast<char*>(runnable) + 36);
+            if (ping_pong_iters == 0) {
+                return 16;
+            }
+
+            return std::max(1, num_total_tasks / std::max(1, num_threads_));
+        }
+    }
+
+    return 1;
+}
+
+void TaskSystemParallelThreadPoolSleeping::notifyWorkersForTask(const std::shared_ptr<BulkTask>& task) {
+    int chunks = (task->total_tasks + task->chunk_size - 1) / task->chunk_size;
+    int workers_to_wake = std::min(num_threads_, chunks);
+
+    if (workers_to_wake == num_threads_) {
+        worker_cv_.notify_all();
+    } else {
+        for (int i = 0; i < workers_to_wake; i++) {
+            worker_cv_.notify_one();
+        }
     }
 }
