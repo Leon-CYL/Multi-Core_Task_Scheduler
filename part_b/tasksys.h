@@ -97,6 +97,14 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         int finished_tasks_;
         std::atomic<bool> shut_down_;
         std::atomic<int> ready_tasks_;
+        IRunnable* sync_runnable_;
+        int sync_total_tasks_;
+        int sync_chunk_size_;
+        int sync_wake_budget_;
+        int sync_active_workers_;
+        std::atomic<int> sync_next_task_id_;
+        std::atomic<int> sync_completed_tasks_;
+        bool sync_has_task_;
 
         std::mutex scheduler_mutex_;
         std::condition_variable worker_cv_;
@@ -109,6 +117,7 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         void runTaskRange(const std::shared_ptr<BulkTask>& task, int start_id, int end_id);
         int chooseChunkSize(IRunnable* runnable, int num_total_tasks);
         void notifyWorkersForTask(const std::shared_ptr<BulkTask>& task);
+        void runSyncRange(IRunnable* runnable, int total_tasks, int start_id, int end_id);
 };
 
 

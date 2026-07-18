@@ -134,6 +134,14 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
     finished_tasks_ = 0;
     shut_down_ = false;
     ready_tasks_.store(0, std::memory_order_relaxed);
+    sync_runnable_ = nullptr;
+    sync_total_tasks_ = 0;
+    sync_chunk_size_ = 1;
+    sync_wake_budget_ = 0;
+    sync_active_workers_ = 0;
+    sync_next_task_id_.store(0, std::memory_order_relaxed);
+    sync_completed_tasks_.store(0, std::memory_order_relaxed);
+    sync_has_task_ = false;
 
     for (int i = 0; i < num_threads_; i++) {
         thread_pool_.push_back(std::thread(&TaskSystemParallelThreadPoolSleeping::workerLoop, this));
@@ -158,39 +166,53 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
-    std::vector<TaskID> no_deps;
-    TaskID task_id = runAsyncWithDeps(runnable, num_total_tasks, no_deps);
+    if (num_total_tasks <= 0) {
+        return;
+    }
+
+    int chunk_size = chooseChunkSize(runnable, num_total_tasks);
+    int chunks = (num_total_tasks + chunk_size - 1) / chunk_size;
+    int workers_to_wake = std::min(num_threads_, std::max(0, chunks - 1));
+
+    {
+        std::unique_lock<std::mutex> lock(scheduler_mutex_);
+        sync_runnable_ = runnable;
+        sync_total_tasks_ = num_total_tasks;
+        sync_chunk_size_ = chunk_size;
+        sync_wake_budget_ = workers_to_wake;
+        sync_next_task_id_.store(0, std::memory_order_release);
+        sync_completed_tasks_.store(0, std::memory_order_release);
+        sync_has_task_ = true;
+    }
+
+    if (workers_to_wake == num_threads_) {
+        worker_cv_.notify_all();
+    } else {
+        for (int i = 0; i < workers_to_wake; i++) {
+            worker_cv_.notify_one();
+        }
+    }
 
     while (true) {
-        std::shared_ptr<BulkTask> task;
-        int start_id = -1;
-        int end_id = -1;
-
-        {
-            std::unique_lock<std::mutex> lock(scheduler_mutex_);
-            std::unordered_map<TaskID, std::shared_ptr<BulkTask> >::iterator task_it =
-                tasks_.find(task_id);
-
-            if (task_it == tasks_.end() || task_it->second->finished) {
-                break;
-            }
-
-            task = task_it->second;
-            if (task->next_task_id < task->total_tasks) {
-                start_id = task->next_task_id;
-                end_id = std::min(start_id + task->chunk_size, task->total_tasks);
-                task->next_task_id = end_id;
-            }
-        }
-
-        if (start_id < 0) {
+        int start_id = sync_next_task_id_.fetch_add(chunk_size, std::memory_order_relaxed);
+        if (start_id >= num_total_tasks) {
             break;
         }
 
-        runTaskRange(task, start_id, end_id);
+        int end_id = std::min(start_id + chunk_size, num_total_tasks);
+        runSyncRange(runnable, num_total_tasks, start_id, end_id);
     }
 
-    sync();
+    {
+        std::unique_lock<std::mutex> lock(scheduler_mutex_);
+        done_cv_.wait(lock, [this, num_total_tasks] {
+            return sync_completed_tasks_.load(std::memory_order_acquire) == num_total_tasks;
+        });
+        sync_has_task_ = false;
+        done_cv_.wait(lock, [this] {
+            return sync_active_workers_ == 0;
+        });
+    }
 }
 
 TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
@@ -254,14 +276,44 @@ void TaskSystemParallelThreadPoolSleeping::workerLoop() {
             }
 
             std::unique_lock<std::mutex> lock(scheduler_mutex_);
-            if (!shut_down_ && ready_queue_.empty()) {
+            if (!shut_down_ && ready_queue_.empty() &&
+                (!sync_has_task_ || sync_wake_budget_ == 0)) {
                 worker_cv_.wait(lock, [this] {
-                    return shut_down_ || !ready_queue_.empty();
+                    return shut_down_ || !ready_queue_.empty() ||
+                           (sync_has_task_ && sync_wake_budget_ > 0);
                 });
             }
 
-            if (shut_down_ && ready_queue_.empty()) {
+            if (shut_down_ && ready_queue_.empty() &&
+                (!sync_has_task_ || sync_wake_budget_ == 0)) {
                 return;
+            }
+
+            if (sync_has_task_ && sync_wake_budget_ > 0) {
+                sync_wake_budget_--;
+                sync_active_workers_++;
+                IRunnable* runnable = sync_runnable_;
+                int total_tasks = sync_total_tasks_;
+                int chunk_size = sync_chunk_size_;
+                lock.unlock();
+
+                while (true) {
+                    int sync_start_id = sync_next_task_id_.fetch_add(chunk_size, std::memory_order_relaxed);
+                    if (sync_start_id >= total_tasks) {
+                        break;
+                    }
+
+                    int sync_end_id = std::min(sync_start_id + chunk_size, total_tasks);
+                    runSyncRange(runnable, total_tasks, sync_start_id, sync_end_id);
+                }
+
+                lock.lock();
+                sync_active_workers_--;
+                if (sync_active_workers_ == 0) {
+                    done_cv_.notify_all();
+                }
+                lock.unlock();
+                continue;
             }
 
             task = ready_queue_.front();
@@ -300,6 +352,22 @@ void TaskSystemParallelThreadPoolSleeping::runTaskRange(const std::shared_ptr<Bu
         if (task->completed_tasks == task->total_tasks) {
             finishTaskLocked(task);
         }
+    }
+}
+
+void TaskSystemParallelThreadPoolSleeping::runSyncRange(IRunnable* runnable,
+                                                        int total_tasks,
+                                                        int start_id,
+                                                        int end_id) {
+    for (int id = start_id; id < end_id; id++) {
+        runnable->runTask(id, total_tasks);
+    }
+
+    int completed = sync_completed_tasks_.fetch_add(end_id - start_id, std::memory_order_acq_rel) +
+                    (end_id - start_id);
+    if (completed == total_tasks) {
+        std::unique_lock<std::mutex> lock(scheduler_mutex_);
+        done_cv_.notify_all();
     }
 }
 
@@ -347,7 +415,7 @@ int TaskSystemParallelThreadPoolSleeping::chooseChunkSize(IRunnable* runnable, i
                 return 16;
             }
 
-            return 2;
+            return std::max(1, num_total_tasks / std::max(1, num_threads_));
         }
     }
 
