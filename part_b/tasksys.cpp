@@ -347,7 +347,7 @@ int TaskSystemParallelThreadPoolSleeping::chooseChunkSize(IRunnable* runnable, i
                 return 16;
             }
 
-            return std::max(1, num_total_tasks / std::max(1, num_threads_));
+            return 2;
         }
     }
 
